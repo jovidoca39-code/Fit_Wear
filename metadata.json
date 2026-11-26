@@ -2,5 +2,7 @@
   "name": "DUNA ACTIVE — Gestión de Inventario, Ventas y Contabilidad",
   "description": "Sistema comercial integral para DUNA ACTIVE (Antofagasta, Chile): control de inventario con variantes y packs, ventas con descuento atómico de stock, compras, proveedores, flujo de caja, contabilidad, simulador de reinversión y reportes PDF/Excel.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
