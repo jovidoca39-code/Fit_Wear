@@ -41,8 +41,10 @@ function sanitizeImageUrl(url: string | undefined): string {
     trimmed.startsWith('https://') ||
     trimmed.startsWith('http://') ||
     trimmed.startsWith('data:image/jpeg;base64,') ||
+    trimmed.startsWith('data:image/jpg;base64,') ||
     trimmed.startsWith('data:image/png;base64,') ||
-    trimmed.startsWith('data:image/webp;base64,')
+    trimmed.startsWith('data:image/webp;base64,') ||
+    trimmed.startsWith('data:image/gif;base64,')
   ) {
     // Limit base64 photo payload to ~4MB
     if (trimmed.startsWith('data:image/') && trimmed.length > 5_500_000) {
@@ -589,13 +591,259 @@ apiRouter.post('/variants/:id/adjust', async (req: AuthRequest, res) => {
   }
 });
 
-// Bulk import products from Excel/CSV rows
+// Quick update product photos (replace main photo or update gallery)
+const updatePhotosSchema = z.object({
+  mainPhoto: z.string().default(''),
+  galleryPhotos: z.array(z.string()).default([]),
+});
+
+apiRouter.patch('/products/:id/photos', async (req: AuthRequest, res) => {
+  try {
+    const productId = Number(req.params.id);
+    if (!Number.isInteger(productId)) return res.status(400).json({ error: 'ID inválido' });
+    const parsed = updatePhotosSchema.parse(req.body);
+    const userId = req.dbUser!.id;
+    const email = req.dbUser!.email;
+
+    const mainPhoto = sanitizeImageUrl(parsed.mainPhoto);
+    const galleryPhotos = Array.from(
+      new Set(parsed.galleryPhotos.map((u) => sanitizeImageUrl(u)).filter(Boolean)),
+    ).slice(0, 12);
+    if (mainPhoto && !galleryPhotos.includes(mainPhoto)) {
+      galleryPhotos.unshift(mainPhoto);
+    }
+
+    const updated = await db.transaction(async (tx) => {
+      const existing = await tx
+        .select()
+        .from(products)
+        .where(and(eq(products.id, productId), eq(products.userId, userId)));
+      if (existing.length === 0) throw new Error('Producto no encontrado');
+
+      const [prod] = await tx
+        .update(products)
+        .set({
+          mainPhoto: mainPhoto || galleryPhotos[0] || '',
+          galleryPhotos,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(products.id, productId), eq(products.userId, userId)))
+        .returning();
+
+      await logAudit(
+        tx,
+        userId,
+        'product',
+        productId,
+        'update_photos',
+        `Fotografías actualizadas en ${prod.name} (${galleryPhotos.length} foto/s)`,
+        email,
+      );
+
+      return prod;
+    });
+
+    res.json(updated);
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: error.issues[0]?.message || 'Datos de imagen inválidos' });
+    }
+    res.status(400).json({ error: error.message || 'No se pudieron guardar las fotografías.' });
+  }
+});
+
+// Quick restock product variants directly from inventory
+const quickRestockItemSchema = z.object({
+  variantId: z.number().int().optional(),
+  color: z.string().min(1).default('Negro'),
+  size: z.string().min(1).default('M'),
+  addQty: z.number().int().min(1),
+  unitCost: z.number().min(0).optional(),
+  minStock: z.number().int().min(0).optional(),
+});
+
+const quickRestockSchema = z.object({
+  items: z.array(quickRestockItemSchema).min(1, 'Ingresa al menos una talla con cantidad a reponer'),
+  reason: z.string().default('Reposición rápida de inventario'),
+  recordCashOutflow: z.boolean().default(false),
+  accountId: z.number().int().nullable().optional(),
+  paymentMethod: z.string().default('Transferencia'),
+  date: z.string().optional(),
+});
+
+apiRouter.post('/products/:id/restock', async (req: AuthRequest, res) => {
+  try {
+    const productId = Number(req.params.id);
+    if (!Number.isInteger(productId)) return res.status(400).json({ error: 'ID inválido' });
+    const parsed = quickRestockSchema.parse(req.body);
+    const userId = req.dbUser!.id;
+    const email = req.dbUser!.email;
+    const txDate = parsed.date || todayChile();
+
+    const result = await db.transaction(async (tx) => {
+      const [product] = await tx
+        .select()
+        .from(products)
+        .where(and(eq(products.id, productId), eq(products.userId, userId)));
+      if (!product) throw new Error('Producto no encontrado');
+
+      const existingVariants = await tx
+        .select()
+        .from(productVariants)
+        .where(and(eq(productVariants.productId, productId), eq(productVariants.userId, userId)));
+
+      const byId = new Map(existingVariants.map((v) => [v.id, v]));
+      const byColorSize = new Map(
+        existingVariants.map((v) => [`${v.color.trim().toLowerCase()}::${v.size.trim().toLowerCase()}`, v]),
+      );
+
+      let totalUnitsAdded = 0;
+      let totalRestockCost = 0;
+      const summaryParts: string[] = [];
+
+      for (const item of parsed.items) {
+        const cleanColor = item.color.trim() || 'Estándar';
+        const cleanSize = item.size.trim().toUpperCase();
+        const key = `${cleanColor.toLowerCase()}::${cleanSize.toLowerCase()}`;
+        const existing = item.variantId ? byId.get(item.variantId) : byColorSize.get(key);
+
+        const defaultUnitCost = product.purchasePrice / Math.max(1, product.packUnits);
+        const incomingCost =
+          item.unitCost !== undefined && item.unitCost > 0
+            ? item.unitCost
+            : existing?.unitCost || defaultUnitCost;
+
+        if (existing) {
+          const prevStock = existing.stock;
+          const newStock = prevStock + item.addQty;
+          const weightedCost =
+            prevStock + item.addQty > 0 && incomingCost > 0
+              ? (prevStock * existing.unitCost + item.addQty * incomingCost) / (prevStock + item.addQty)
+              : existing.unitCost;
+
+          await tx
+            .update(productVariants)
+            .set({
+              stock: newStock,
+              unitCost: weightedCost,
+              updatedAt: new Date(),
+            })
+            .where(and(eq(productVariants.id, existing.id), eq(productVariants.userId, userId)));
+
+          existing.stock = newStock;
+          existing.unitCost = weightedCost;
+
+          await tx.insert(inventoryMovements).values({
+            userId,
+            productId: product.id,
+            variantId: existing.id,
+            movementType: 'compra_recibida',
+            quantityChange: item.addQty,
+            previousStock: prevStock,
+            newStock,
+            unitCost: incomingCost,
+            referenceType: 'reposicion',
+            referenceId: product.id,
+            reason: `${parsed.reason.trim() || 'Reposición rápida'} (${existing.color} / ${existing.size})`,
+            performedBy: email,
+            isExample: product.isExample,
+          });
+          summaryParts.push(`${existing.size} +${item.addQty}`);
+        } else {
+          const [createdVariant] = await tx
+            .insert(productVariants)
+            .values({
+              userId,
+              productId: product.id,
+              skuVariant: generateVariantSku(product.sku, cleanColor, cleanSize),
+              size: cleanSize,
+              color: cleanColor,
+              stock: item.addQty,
+              reservedStock: 0,
+              minStock: item.minStock ?? 2,
+              unitCost: incomingCost,
+            })
+            .returning();
+
+          byId.set(createdVariant.id, createdVariant);
+          byColorSize.set(key, createdVariant);
+
+          await tx.insert(inventoryMovements).values({
+            userId,
+            productId: product.id,
+            variantId: createdVariant.id,
+            movementType: 'compra_recibida',
+            quantityChange: item.addQty,
+            previousStock: 0,
+            newStock: item.addQty,
+            unitCost: incomingCost,
+            referenceType: 'reposicion',
+            referenceId: product.id,
+            reason: `${parsed.reason.trim() || 'Reposición rápida'} (${cleanColor} / ${cleanSize})`,
+            performedBy: email,
+            isExample: product.isExample,
+          });
+          summaryParts.push(`${cleanSize} +${item.addQty}`);
+        }
+
+        totalUnitsAdded += item.addQty;
+        totalRestockCost += item.addQty * incomingCost;
+      }
+
+      if (parsed.recordCashOutflow && totalRestockCost > 0) {
+        let accountId = parsed.accountId ?? null;
+        if (!accountId) {
+          const userAccounts = await tx.select().from(accounts).where(eq(accounts.userId, userId));
+          accountId = userAccounts.find((a) => a.isDefault)?.id ?? userAccounts[0]?.id ?? null;
+        }
+        await tx.insert(financialTransactions).values({
+          userId,
+          date: txDate,
+          direction: 'egreso',
+          classification: 'pago_proveedor',
+          category: 'Reposición de inventario',
+          concept: `Reposición ${product.name} (${summaryParts.join(', ')})`,
+          amount: totalRestockCost,
+          paymentMethod: parsed.paymentMethod || 'Transferencia',
+          accountId,
+          referenceType: 'reposicion',
+          referenceId: product.id,
+          notes: parsed.reason.trim(),
+          performedBy: email,
+          isExample: product.isExample,
+        });
+      }
+
+      await logAudit(
+        tx,
+        userId,
+        'product',
+        product.id,
+        'restock',
+        `Reposición en ${product.name}: +${totalUnitsAdded} prendas (${summaryParts.join(', ')})`,
+        email,
+      );
+
+      return { ok: true, totalUnitsAdded, totalCost: totalRestockCost };
+    });
+
+    res.json(result);
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: error.issues[0]?.message || 'Datos de reposición inválidos' });
+    }
+    res.status(400).json({ error: error.message || 'No se pudo registrar la reposición.' });
+  }
+});
+
+// Bulk import products from ZIP, JSON, CSV or Excel with SKU deduplication & images
 const importRowSchema = z.object({
   sku: z.string().optional(),
   name: z.string().min(1),
   category: z.string().default('Calzas'),
   brand: z.string().default(''),
   model: z.string().default(''),
+  description: z.string().default(''),
   color: z.string().default('Negro'),
   size: z.string().default('M'),
   stock: z.number().int().min(0).default(0),
@@ -605,70 +853,357 @@ const importRowSchema = z.object({
   isPack: z.boolean().default(false),
   packUnits: z.number().int().min(1).default(1),
   location: z.string().default('Bodega Antofagasta'),
+  mainPhoto: z.string().optional(),
+  galleryPhotos: z.array(z.string()).optional(),
+});
+
+const importStructuredVariantSchema = z.object({
+  color: z.string().min(1).default('Negro'),
+  size: z.string().min(1).default('M'),
+  stock: z.number().int().min(0).default(0),
+  minStock: z.number().int().min(0).default(2),
+  unitCost: z.number().min(0).optional(),
+});
+
+const importStructuredProductSchema = z.object({
+  sku: z.string().optional(),
+  name: z.string().min(1),
+  category: z.string().default('Calzas'),
+  brand: z.string().default(''),
+  model: z.string().default(''),
+  description: z.string().default(''),
+  supplierName: z.string().optional(),
+  purchaseDate: z.string().optional(),
+  purchasePrice: z.number().min(0).default(0),
+  salePrice: z.number().min(0).default(0),
+  singleUnitSalePrice: z.number().min(0).optional(),
+  isPack: z.boolean().default(false),
+  packUnits: z.number().int().min(1).default(1),
+  packComposition: z.string().default(''),
+  location: z.string().default('Bodega Antofagasta'),
+  mainPhoto: z.string().default(''),
+  galleryPhotos: z.array(z.string()).default([]),
+  isActive: z.boolean().default(true),
+  variants: z.array(importStructuredVariantSchema).min(1),
+});
+
+const bulkImportBodySchema = z.object({
+  duplicateStrategy: z.enum(['skip', 'update_replace', 'update_add']).default('skip'),
+  products: z.array(importStructuredProductSchema).min(1).max(300).optional(),
+  rows: z.array(importRowSchema).min(1).max(500).optional(),
 });
 
 apiRouter.post('/products/import', async (req: AuthRequest, res) => {
   try {
-    const rows = z.array(importRowSchema).min(1).max(300).parse(req.body.rows);
+    const parsedBody = bulkImportBodySchema.parse(req.body);
     const userId = req.dbUser!.id;
     const email = req.dbUser!.email;
+    const duplicateStrategy = parsedBody.duplicateStrategy;
 
-    let createdCount = 0;
-    await db.transaction(async (tx) => {
-      // Group rows by SKU or Name
-      const grouped = new Map<string, typeof rows>();
-      for (const r of rows) {
+    // Normalize either structured products[] or legacy flat rows[] into structured list
+    let structuredProducts: z.infer<typeof importStructuredProductSchema>[] = [];
+    if (parsedBody.products && parsedBody.products.length > 0) {
+      structuredProducts = parsedBody.products;
+    } else if (parsedBody.rows && parsedBody.rows.length > 0) {
+      const grouped = new Map<string, z.infer<typeof importRowSchema>[]>();
+      for (const r of parsedBody.rows) {
         const key = (r.sku?.trim() || r.name.trim()).toLowerCase();
         const list = grouped.get(key) || [];
         list.push(r);
         grouped.set(key, list);
       }
-
       for (const groupRows of grouped.values()) {
         const first = groupRows[0];
-        const sku = first.sku?.trim() || generateSku(first.name, first.category);
         const packUnits = first.isPack ? Math.max(2, first.packUnits) : 1;
         const unitCost = first.purchasePrice / packUnits;
+        structuredProducts.push({
+          sku: first.sku,
+          name: first.name,
+          category: first.category,
+          brand: first.brand,
+          model: first.model,
+          description: first.description || '',
+          purchasePrice: first.purchasePrice,
+          salePrice: first.salePrice,
+          isPack: first.isPack,
+          packUnits,
+          packComposition: '',
+          location: first.location,
+          mainPhoto: first.mainPhoto || '',
+          galleryPhotos: first.galleryPhotos || [],
+          isActive: true,
+          variants: groupRows.map((vr) => ({
+            color: vr.color,
+            size: vr.size,
+            stock: vr.stock,
+            minStock: vr.minStock,
+            unitCost,
+          })),
+        });
+      }
+    } else {
+      return res.status(400).json({ error: 'No se recibieron productos válidos para importar.' });
+    }
 
+    let createdCount = 0;
+    let updatedCount = 0;
+    let skippedCount = 0;
+    let processedVariants = 0;
+
+    await db.transaction(async (tx) => {
+      const [existingProducts, existingVariants, existingSuppliers] = await Promise.all([
+        tx.select().from(products).where(eq(products.userId, userId)),
+        tx.select().from(productVariants).where(eq(productVariants.userId, userId)),
+        tx.select().from(suppliers).where(eq(suppliers.userId, userId)),
+      ]);
+
+      const productBySku = new Map<string, (typeof existingProducts)[number]>();
+      for (const p of existingProducts) {
+        productBySku.set(p.sku.trim().toLowerCase(), p);
+      }
+
+      const variantsByProductId = new Map<number, (typeof existingVariants)[number][]>();
+      for (const v of existingVariants) {
+        const list = variantsByProductId.get(v.productId) || [];
+        list.push(v);
+        variantsByProductId.set(v.productId, list);
+      }
+
+      const supplierByName = new Map(
+        existingSuppliers.map((s) => [s.name.trim().toLowerCase(), s.id]),
+      );
+
+      for (const item of structuredProducts) {
+        const cleanSku = item.sku?.trim() || generateSku(item.name, item.category);
+        const skuKey = cleanSku.toLowerCase();
+        const packUnits = item.isPack ? Math.max(2, item.packUnits) : 1;
+        const defaultUnitCost = item.purchasePrice / packUnits;
+        const resolvedSalePrice =
+          item.salePrice > 0 ? item.salePrice : Math.round(item.purchasePrice + 10000 * packUnits);
+        const resolvedSingleSalePrice = item.isPack
+          ? item.singleUnitSalePrice || Math.round(resolvedSalePrice / packUnits)
+          : resolvedSalePrice;
+
+        const cleanMainPhoto = sanitizeImageUrl(item.mainPhoto);
+        const cleanGallery = Array.from(
+          new Set(item.galleryPhotos.map((u) => sanitizeImageUrl(u)).filter(Boolean)),
+        ).slice(0, 12);
+        if (cleanMainPhoto && !cleanGallery.includes(cleanMainPhoto)) {
+          cleanGallery.unshift(cleanMainPhoto);
+        }
+        const finalMainPhoto = cleanMainPhoto || cleanGallery[0] || '';
+        const matchedSupplierId = item.supplierName
+          ? supplierByName.get(item.supplierName.trim().toLowerCase()) ?? null
+          : null;
+
+        // Deduplicate variants within the same product by color + size
+        const mergedVariants = new Map<
+          string,
+          { color: string; size: string; stock: number; minStock: number; unitCost: number }
+        >();
+        for (const vr of item.variants) {
+          const vColor = vr.color.trim() || 'Estándar';
+          const vSize = vr.size.trim().toUpperCase() || 'U';
+          const vKey = `${vColor.toLowerCase()}::${vSize.toLowerCase()}`;
+          const prev = mergedVariants.get(vKey);
+          const vCost = vr.unitCost !== undefined && vr.unitCost > 0 ? vr.unitCost : defaultUnitCost;
+          if (prev) {
+            prev.stock += vr.stock;
+            if (vCost > 0) prev.unitCost = vCost;
+          } else {
+            mergedVariants.set(vKey, {
+              color: vColor,
+              size: vSize,
+              stock: vr.stock,
+              minStock: vr.minStock ?? 2,
+              unitCost: vCost,
+            });
+          }
+        }
+
+        const existingProd = productBySku.get(skuKey);
+
+        if (existingProd) {
+          if (duplicateStrategy === 'skip') {
+            skippedCount++;
+            continue;
+          }
+
+          // Update existing product (preserving existing photos if import did not bring new ones)
+          const mergedGallery =
+            cleanGallery.length > 0
+              ? Array.from(new Set([...cleanGallery, ...(existingProd.galleryPhotos || [])])).slice(0, 12)
+              : existingProd.galleryPhotos || [];
+          const nextMainPhoto = finalMainPhoto || existingProd.mainPhoto || mergedGallery[0] || '';
+
+          const [updProd] = await tx
+            .update(products)
+            .set({
+              name: item.name.trim() || existingProd.name,
+              category: item.category || existingProd.category,
+              brand: item.brand.trim() || existingProd.brand,
+              model: item.model.trim() || existingProd.model,
+              description: item.description.trim() || existingProd.description,
+              supplierId: matchedSupplierId ?? existingProd.supplierId,
+              purchasePrice: item.purchasePrice > 0 ? item.purchasePrice : existingProd.purchasePrice,
+              salePrice: item.salePrice > 0 ? item.salePrice : existingProd.salePrice,
+              singleUnitSalePrice:
+                item.salePrice > 0 ? resolvedSingleSalePrice : existingProd.singleUnitSalePrice,
+              location: item.location.trim() || existingProd.location,
+              mainPhoto: nextMainPhoto,
+              galleryPhotos: mergedGallery,
+              isPack: item.isPack,
+              packUnits,
+              packComposition: item.packComposition.trim() || existingProd.packComposition,
+              isActive: item.isActive,
+              updatedAt: new Date(),
+            })
+            .where(and(eq(products.id, existingProd.id), eq(products.userId, userId)))
+            .returning();
+
+          productBySku.set(skuKey, updProd);
+
+          const curVariants = variantsByProductId.get(existingProd.id) || [];
+          const curVarMap = new Map(
+            curVariants.map((v) => [`${v.color.trim().toLowerCase()}::${v.size.trim().toLowerCase()}`, v]),
+          );
+
+          for (const [vKey, vr] of mergedVariants.entries()) {
+            const existingV = curVarMap.get(vKey);
+            if (existingV) {
+              const targetStock =
+                duplicateStrategy === 'update_add'
+                  ? existingV.stock + vr.stock
+                  : Math.max(existingV.reservedStock, vr.stock);
+              const nextCost =
+                duplicateStrategy === 'update_add' && vr.stock > 0 && vr.unitCost > 0
+                  ? (existingV.stock * existingV.unitCost + vr.stock * vr.unitCost) /
+                    Math.max(1, existingV.stock + vr.stock)
+                  : vr.unitCost > 0
+                    ? vr.unitCost
+                    : existingV.unitCost;
+
+              const [updV] = await tx
+                .update(productVariants)
+                .set({
+                  stock: targetStock,
+                  minStock: vr.minStock,
+                  unitCost: nextCost,
+                  updatedAt: new Date(),
+                })
+                .where(and(eq(productVariants.id, existingV.id), eq(productVariants.userId, userId)))
+                .returning();
+
+              curVarMap.set(vKey, updV);
+              if (targetStock !== existingV.stock) {
+                await tx.insert(inventoryMovements).values({
+                  userId,
+                  productId: existingProd.id,
+                  variantId: existingV.id,
+                  movementType:
+                    duplicateStrategy === 'update_add' ? 'compra_recibida' : 'ajuste_manual',
+                  quantityChange: targetStock - existingV.stock,
+                  previousStock: existingV.stock,
+                  newStock: targetStock,
+                  unitCost: vr.unitCost || existingV.unitCost,
+                  referenceType: 'importacion',
+                  referenceId: existingProd.id,
+                  reason: `Actualización por importación masiva SKU ${cleanSku} (${vr.color} / ${vr.size})`,
+                  performedBy: email,
+                  isExample: existingProd.isExample,
+                });
+              }
+            } else {
+              const [newV] = await tx
+                .insert(productVariants)
+                .values({
+                  userId,
+                  productId: existingProd.id,
+                  skuVariant: generateVariantSku(cleanSku, vr.color, vr.size),
+                  size: vr.size,
+                  color: vr.color,
+                  stock: vr.stock,
+                  reservedStock: 0,
+                  minStock: vr.minStock,
+                  unitCost: vr.unitCost,
+                })
+                .returning();
+              curVariants.push(newV);
+              curVarMap.set(vKey, newV);
+              if (vr.stock > 0) {
+                await tx.insert(inventoryMovements).values({
+                  userId,
+                  productId: existingProd.id,
+                  variantId: newV.id,
+                  movementType: 'stock_inicial',
+                  quantityChange: vr.stock,
+                  previousStock: 0,
+                  newStock: vr.stock,
+                  unitCost: vr.unitCost,
+                  referenceType: 'importacion',
+                  referenceId: existingProd.id,
+                  reason: `Nueva talla importada SKU ${cleanSku} (${vr.color} / ${vr.size})`,
+                  performedBy: email,
+                  isExample: false,
+                });
+              }
+            }
+            processedVariants++;
+          }
+          variantsByProductId.set(existingProd.id, curVariants);
+          updatedCount++;
+          continue;
+        }
+
+        // Insert brand-new product
         const [prod] = await tx
           .insert(products)
           .values({
             userId,
-            sku,
-            name: first.name.trim(),
-            category: first.category || 'Calzas',
-            brand: first.brand || '',
-            model: first.model || '',
-            purchaseDate: todayChile(),
-            purchasePrice: first.purchasePrice,
-            salePrice: first.salePrice || first.purchasePrice + 10000 * packUnits,
-            location: first.location || 'Bodega Antofagasta',
-            isPack: first.isPack,
+            sku: cleanSku,
+            name: item.name.trim(),
+            category: item.category || 'Calzas',
+            brand: item.brand.trim(),
+            model: item.model.trim(),
+            description: item.description.trim(),
+            supplierId: matchedSupplierId,
+            purchaseDate: item.purchaseDate || todayChile(),
+            purchasePrice: item.purchasePrice,
+            salePrice: resolvedSalePrice,
+            location: item.location.trim() || 'Bodega Antofagasta',
+            mainPhoto: finalMainPhoto,
+            galleryPhotos: cleanGallery,
+            isPack: item.isPack,
             packUnits,
             allowSingleUnitSale: true,
-            singleUnitSalePrice: Math.round(
-              (first.salePrice || first.purchasePrice + 10000 * packUnits) / packUnits,
-            ),
-            isActive: true,
+            packComposition: item.packComposition.trim(),
+            singleUnitSalePrice: resolvedSingleSalePrice,
+            isActive: item.isActive,
             isExample: false,
           })
           .returning();
 
-        for (const vr of groupRows) {
+        productBySku.set(skuKey, prod);
+        const createdVariants: (typeof existingVariants)[number][] = [];
+
+        for (const vr of mergedVariants.values()) {
           const [v] = await tx
             .insert(productVariants)
             .values({
               userId,
               productId: prod.id,
-              skuVariant: generateVariantSku(sku, vr.color, vr.size),
+              skuVariant: generateVariantSku(cleanSku, vr.color, vr.size),
               size: vr.size,
               color: vr.color,
               stock: vr.stock,
               reservedStock: 0,
               minStock: vr.minStock,
-              unitCost,
+              unitCost: vr.unitCost,
             })
             .returning();
+
+          createdVariants.push(v);
+          processedVariants++;
 
           if (vr.stock > 0) {
             await tx.insert(inventoryMovements).values({
@@ -679,15 +1214,16 @@ apiRouter.post('/products/import', async (req: AuthRequest, res) => {
               quantityChange: vr.stock,
               previousStock: 0,
               newStock: vr.stock,
-              unitCost,
-              referenceType: 'manual',
+              unitCost: vr.unitCost,
+              referenceType: 'importacion',
               referenceId: prod.id,
-              reason: `Importación masiva Excel/CSV (${vr.color} / ${vr.size})`,
+              reason: `Importación masiva (${vr.color} / ${vr.size})`,
               performedBy: email,
               isExample: false,
             });
           }
         }
+        variantsByProductId.set(prod.id, createdVariants);
         createdCount++;
       }
 
@@ -697,15 +1233,22 @@ apiRouter.post('/products/import', async (req: AuthRequest, res) => {
         'product',
         null,
         'import',
-        `Importación masiva de ${createdCount} productos (${rows.length} variantes)`,
+        `Importación masiva: ${createdCount} nuevos, ${updatedCount} actualizados, ${skippedCount} omitidos (${processedVariants} variantes)`,
         email,
       );
     });
 
-    res.status(201).json({ importedProducts: createdCount, importedVariants: rows.length });
+    res.status(201).json({
+      importedProducts: createdCount,
+      updatedProducts: updatedCount,
+      skippedProducts: skippedCount,
+      importedVariants: processedVariants,
+    });
   } catch (error: any) {
     if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Formato de archivo inválido. Revisa las columnas.' });
+      return res.status(400).json({
+        error: error.issues[0]?.message || 'Formato de importación inválido. Revisa los campos.',
+      });
     }
     console.error('Import error:', error);
     res.status(500).json({ error: error.message || 'Error al importar inventario.' });
